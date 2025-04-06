@@ -1,20 +1,57 @@
 import numpy as np
+import json
 import pandas as pd
 import matplotlib.pyplot as plt
 from mylib import *
-## For Keras backend we are using the JAX
 from keras import Sequential
-from keras.layers import LSTM, Dense
-from keras.callbacks import ModelCheckpoint
-from keras.models import load_model
+from keras.layers import LSTM, Dense, Dropout # type: ignore
+from keras.callbacks import ModelCheckpoint, EarlyStopping # type: ignore
+from keras.models import load_model # type: ignore
 from sklearn.preprocessing import MinMaxScaler
+
+###### CONFIG ######
+input_csv = 'csv/SingapurCargoVesselsMonthly.csv'
+models_base_dir = 'models'
+model_dir_tag = 'dropout'
+model_dir = create_model_dir(models_base_dir, model_dir_tag)
+best_model_path = f"{model_dir}/best_model.h5"
+
+
+sequence_length = 18 # how many months to look back
+cfg_epochs = 400
+cfg_patience = 90
+cfg_batch_size = 32
+cfg_LSTM_units = 128
+cfg_dropout = 0.3
+cfg_train_ratio = 0.70
+cfg_validation_ratio = 0.15
+cfg_optimizer = 'adam'
+cfg_loss = 'mean_squared_error'
+
+run_params = {
+    'input_csv': input_csv,
+    'sequence_length': sequence_length,
+    'cfg_train_ratio': cfg_train_ratio,
+    'cfg_validation_ratio': cfg_validation_ratio,
+    'cfg_epochs': cfg_epochs,
+    'cfg_patience': cfg_patience,
+    'cfg_batch_size': cfg_batch_size,
+    'cfg_LSTM_units': cfg_LSTM_units,
+    'cfg_dropout': cfg_dropout,
+    'cfg_optimizer': cfg_optimizer,
+    'cfg_loss': cfg_loss,
+}
+
+###### END OF CONFIG ######
+
+
+
 
 ## Load and preprocess / show the dataset
 # Load the dataset
-input_csv = 'csv/SingapurCargoVesselsMonthly.csv'
 dataset = pd.read_csv(input_csv)
 dataset['month'] = pd.to_datetime(dataset['month'], format='%Y-%m')
-print(dataset.head())
+# print(dataset.head())
 
 # TODO:
 # Perform data preprocessing steps (e.g., handle missing values, normalization)
@@ -33,23 +70,23 @@ df = df.sort_values(by='month').reset_index(drop=True)
 # Extract values (monthly vessel counts)
 vessel_data = df['vessels'].values.reshape(-1, 1)
 
-# (B) Scale the data to [0,1] range to help LSTM training
+# Scale the data to [0,1] range to help LSTM training
 scaler = MinMaxScaler(feature_range=(0, 1))
 vessel_data_scaled = scaler.fit_transform(vessel_data)
 
 dataset_size = len(df)
 # Prepare the input and output sequences
-sequence_length = 6 # how many months to look back
 X_all, y_all = create_sequences(vessel_data_scaled, sequence_length)
 
-# (D) Train-test split
+# Train-test split
 # Split the data into training and testing sets 80/20
 # For example, use the last 12 months (or more) as test
-train_size = int(len(X_all) * 0.8)
-X_train, y_train = X_all[:train_size], y_all[:train_size]
-X_test, y_test = X_all[train_size:], y_all[train_size:]
+train_size = int(len(X_all) * cfg_train_ratio)
+val_end= int(len(X_all) * (cfg_train_ratio + cfg_validation_ratio))
 
-print(f"x_train {X_train} y_train {y_train}")
+X_train, y_train = X_all[:train_size], y_all[:train_size]
+X_val, y_val     = X_all[train_size:val_end], y_all[train_size:val_end]
+X_test, y_test   = X_all[val_end:], y_all[val_end:]
 
 # -------------------------------------------------
 # 2. Build the LSTM Model
@@ -59,54 +96,77 @@ print(f"x_train {X_train} y_train {y_train}")
 # to save only the best model 
 
 checkpoint = ModelCheckpoint(
-    'models/best_model.h5',         # TODO: add path, and create unique model names
+    best_model_path,         # TODO: add path, and create unique model names
     monitor='val_loss',      # metric to monitor
     verbose=1,               # verbosity mode (1 = progress messages)
     save_best_only=True,     # only save when the monitored metric improves
     mode='min'               # mode should be 'min' if you're monitoring loss
 )
 
+# Callback to stop training if validation loss doesn't improve for X epochs
+early_stopping = EarlyStopping(
+    monitor='val_loss',
+    patience=cfg_patience,
+    verbose=1,
+    restore_best_weights=True
+)
+
+
 # TODO add Dropout layers to prevent overfitting
 model = Sequential()
-model.add(LSTM(50, return_sequences=True, input_shape=(sequence_length, 1)))
-model.add(LSTM(50))
+model.add(LSTM(cfg_LSTM_units, return_sequences=True, input_shape=(sequence_length, 1)))
+model.add(Dropout(cfg_dropout))  # Randomly drops X% of the outputs from the LSTM layer
+model.add(LSTM(cfg_LSTM_units))
+model.add(Dropout(cfg_dropout))  # Randomly drops X% of the outputs from the LSTM layer
 model.add(Dense(1))
 
-model.compile(optimizer='adam', loss='mean_squared_error')
+model.compile(optimizer=cfg_optimizer, loss=cfg_loss)
 
 # -------------------------------------------------
 # 3. Train the Model
 # -------------------------------------------------
 history = model.fit(
     X_train, y_train, 
-    epochs=100, 
-    batch_size=16,
-    validation_data=(X_test, y_test), 
+    epochs=cfg_epochs, 
+    batch_size=cfg_batch_size,
+    validation_data=(X_val, y_val), 
     verbose=1,
-    callbacks=[checkpoint]  # Add the checkpoint callback
+    callbacks=[checkpoint,early_stopping]  # Add the checkpoint callback
     )
 
 # -------------------------------------------------
 # 4. Evaluate & Predict
 # -------------------------------------------------
 # Load the best model
-best_model = load_model('models/best_model.h5')
+best_model = load_model(best_model_path)
 
 
 
-# (A) Predictions on test set
+# Predictions on test set
 predictions_scaled = best_model.predict(X_test)
 predictions = scaler.inverse_transform(predictions_scaled)
 actual = scaler.inverse_transform(y_test)
 
 
-# (B) Plot test predictions vs. actual values
-plt.figure()
-plt.plot(range(len(actual)), actual, label='Actual')
-plt.plot(range(len(predictions)), predictions, label='Predicted')
-plt.title('Test Set: Actual vs. Predicted Vessel Counts')
-plt.xlabel('Test Samples')
-plt.ylabel('Vessel Count')
-plt.legend()
-plt.show()
 
+# Saving model config and predictions diagram
+print(f"Num of predictions: {len(predictions)}")
+print(f"Num of actual test entries: {len(actual)}")
+
+# The evaluation on test set is done within the model.fit(),
+# So we just read from the history object
+save_model_loss(model_dir, min(history.history['val_loss']))
+
+
+save_model_config(best_model, run_params, model_dir)
+
+
+# Plot test predictions vs. actual values
+test_months = df['month'].iloc[val_end + sequence_length:].reset_index(drop=True)
+
+show_predictions_diagram(
+    test_months, 
+    predictions, 
+    actual, 
+    save_path=f"{model_dir}/predictions_diagram.png"
+)

@@ -4,6 +4,7 @@
 csv/*.csv
 ## ignore models, to prevent overwriting
 models/*.h5
+models/*
 
 
 # Default
