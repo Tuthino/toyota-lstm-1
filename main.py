@@ -5,7 +5,8 @@ import matplotlib.pyplot as plt
 from mylib import *
 from keras import Sequential
 from keras.layers import LSTM, Dense, Dropout # type: ignore
-from keras.callbacks import ModelCheckpoint, EarlyStopping # type: ignore
+from keras.callbacks import ModelCheckpoint, EarlyStopping, ReduceLROnPlateau # type: ignore
+from keras.optimizers import Adam # type: ignore
 from keras.models import load_model # type: ignore
 from sklearn.preprocessing import MinMaxScaler
 
@@ -17,15 +18,16 @@ model_dir = create_model_dir(models_base_dir, model_dir_tag)
 best_model_path = f"{model_dir}/best_model.h5"
 
 
-sequence_length = 18 # how many months to look back
+sequence_length = 4 # how many months to look back
 cfg_epochs = 400
-cfg_patience = 90
-cfg_batch_size = 32
-cfg_LSTM_units = 128
-cfg_dropout = 0.3
-cfg_train_ratio = 0.70
-cfg_validation_ratio = 0.15
-cfg_optimizer = 'adam'
+cfg_patience = 50
+cfg_batch_size = 16
+cfg_LSTM_units = 64
+cfg_dropout = 0.00
+cfg_train_ratio = 0.60
+cfg_validation_ratio = 0.20
+cfg_learning_rate = 0.002
+cfg_recurrent_dropout = 0.01
 cfg_loss = 'mean_squared_error'
 
 run_params = {
@@ -38,7 +40,7 @@ run_params = {
     'cfg_batch_size': cfg_batch_size,
     'cfg_LSTM_units': cfg_LSTM_units,
     'cfg_dropout': cfg_dropout,
-    'cfg_optimizer': cfg_optimizer,
+    'cfg_learning_rate': cfg_learning_rate,
     'cfg_loss': cfg_loss,
 }
 
@@ -58,7 +60,7 @@ dataset['month'] = pd.to_datetime(dataset['month'], format='%Y-%m')
 
 # Show the diagram of original data for specific months
 # filtered_data = filter_data(dataset,'1993-01', '1993-12')
-# show_diagram(filtered_data)
+# show_diagram(dataset)
 
 
 # Replace 'vessels.csv' with your actual CSV file path
@@ -87,6 +89,9 @@ val_end= int(len(X_all) * (cfg_train_ratio + cfg_validation_ratio))
 X_train, y_train = X_all[:train_size], y_all[:train_size]
 X_val, y_val     = X_all[train_size:val_end], y_all[train_size:val_end]
 X_test, y_test   = X_all[val_end:], y_all[val_end:]
+print(f"Train size: {len(X_train)} ")
+print(f"Validation size: {len(X_val)} ")
+print(f"Test size: {len(X_test)} ")
 
 # -------------------------------------------------
 # 2. Build the LSTM Model
@@ -108,19 +113,32 @@ early_stopping = EarlyStopping(
     monitor='val_loss',
     patience=cfg_patience,
     verbose=1,
-    restore_best_weights=True
+    # restore_best_weights=True
+)
+
+# Create the ReduceLROnPlateau callback
+reduce_lr = ReduceLROnPlateau(
+    monitor='val_loss',  # Metric to monitor
+    factor=0.1,          # Reduce learning rate by half
+    patience=15,         # Wait 10 epochs before reducing learning rate
+    verbose=1,           # Print a message when the learning rate is reduced
+    min_lr=1e-3         # Minimum learning rate allowed
 )
 
 
 # TODO add Dropout layers to prevent overfitting
 model = Sequential()
-model.add(LSTM(cfg_LSTM_units, return_sequences=True, input_shape=(sequence_length, 1)))
+model.add(LSTM(cfg_LSTM_units, return_sequences=True, 
+                input_shape=(sequence_length, 1),
+                recurrent_dropout=cfg_recurrent_dropout)
+               )
 model.add(Dropout(cfg_dropout))  # Randomly drops X% of the outputs from the LSTM layer
-model.add(LSTM(cfg_LSTM_units))
+model.add(LSTM(cfg_LSTM_units, recurrent_dropout=cfg_recurrent_dropout))
 model.add(Dropout(cfg_dropout))  # Randomly drops X% of the outputs from the LSTM layer
 model.add(Dense(1))
 
-model.compile(optimizer=cfg_optimizer, loss=cfg_loss)
+optimizer = Adam(learning_rate=cfg_learning_rate)
+model.compile(optimizer=optimizer, loss=cfg_loss)
 
 # -------------------------------------------------
 # 3. Train the Model
