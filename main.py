@@ -4,7 +4,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from mylib import *
 from keras import Sequential
-from keras.layers import LSTM, Dense, Dropout # type: ignore
+from keras.layers import LSTM, Dense, Dropout, GRU # type: ignore
 from keras.callbacks import ModelCheckpoint, EarlyStopping, ReduceLROnPlateau # type: ignore
 from keras.optimizers import Adam # type: ignore
 from keras.models import load_model # type: ignore
@@ -18,16 +18,16 @@ model_dir = create_model_dir(models_base_dir, model_dir_tag)
 best_model_path = f"{model_dir}/best_model.h5"
 
 
-sequence_length = 4 # how many months to look back
+sequence_length = 12 # how many months to look back
 cfg_epochs = 400
 cfg_patience = 50
 cfg_batch_size = 16
 cfg_LSTM_units = 64
-cfg_dropout = 0.00
-cfg_train_ratio = 0.60
-cfg_validation_ratio = 0.20
-cfg_learning_rate = 0.002
-cfg_recurrent_dropout = 0.01
+cfg_dropout = 0.01
+cfg_train_ratio = 0.80
+cfg_validation_ratio = 0.10
+cfg_learning_rate = 0.0005
+cfg_recurrent_dropout = 0.0
 cfg_loss = 'mean_squared_error'
 
 run_params = {
@@ -67,18 +67,34 @@ dataset['month'] = pd.to_datetime(dataset['month'], format='%Y-%m')
 df = pd.read_csv(input_csv, parse_dates=['month'])
 
 # Make sure the dataframe is sorted by date
-df = df.sort_values(by='month').reset_index(drop=True)
+# df = df.sort_values(by='month').reset_index(drop=True)
+
+df['month_num'] = df['month'].dt.month  # Month as an integer from 1 to 12
+df['month_sin'] = np.sin(2 * np.pi * df['month_num'] / 12)
+df['month_cos'] = np.cos(2 * np.pi * df['month_num'] / 12)
 
 # Extract values (monthly vessel counts)
 vessel_data = df['vessels'].values.reshape(-1, 1)
 
 # Scale the data to [0,1] range to help LSTM training
+# scaler = MinMaxScaler(feature_range=(0, 1))
+# vessel_data_scaled = scaler.fit_transform(vessel_data)
+# Extract and scale vessel counts
+vessel_data = df['vessels'].values.reshape(-1, 1)
 scaler = MinMaxScaler(feature_range=(0, 1))
 vessel_data_scaled = scaler.fit_transform(vessel_data)
 
+# Extract the cyclical features (they are already between -1 and 1)
+month_features = df[['month_sin', 'month_cos']].values
+
+# Combine features: each row now has [scaled vessels, month_sin, month_cos]
+features = np.concatenate([vessel_data_scaled, month_features], axis=1)
+
+
 dataset_size = len(df)
 # Prepare the input and output sequences
-X_all, y_all = create_sequences(vessel_data_scaled, sequence_length)
+# X_all, y_all = create_sequences(vessel_data_scaled, sequence_length)
+X_all, y_all = create_sequences(features, sequence_length, target_idx=0)
 
 # Train-test split
 # Split the data into training and testing sets 80/20
@@ -128,13 +144,26 @@ reduce_lr = ReduceLROnPlateau(
 
 # TODO add Dropout layers to prevent overfitting
 model = Sequential()
-model.add(LSTM(cfg_LSTM_units, return_sequences=True, 
-                input_shape=(sequence_length, 1),
+model.add(GRU(cfg_LSTM_units, return_sequences=True, 
+                input_shape=(sequence_length, 3),
                 recurrent_dropout=cfg_recurrent_dropout)
                )
 model.add(Dropout(cfg_dropout))  # Randomly drops X% of the outputs from the LSTM layer
-model.add(LSTM(cfg_LSTM_units, recurrent_dropout=cfg_recurrent_dropout))
+model.add(GRU(cfg_LSTM_units, return_sequences=True, 
+                input_shape=(sequence_length, 3),
+                recurrent_dropout=cfg_recurrent_dropout)
+               )
+
 model.add(Dropout(cfg_dropout))  # Randomly drops X% of the outputs from the LSTM layer
+model.add(GRU(cfg_LSTM_units, return_sequences=True, 
+                input_shape=(sequence_length, 3),
+                recurrent_dropout=cfg_recurrent_dropout)
+               )
+# model.add(Dropout(cfg_dropout))  # Randomly drops X% of the outputs from the LSTM layer
+# model.add(LSTM(cfg_LSTM_units, recurrent_dropout=cfg_recurrent_dropout))
+model.add(GRU(cfg_LSTM_units, recurrent_dropout=cfg_recurrent_dropout,input_shape=(sequence_length, 3)))
+# model.add(Dropout(cfg_dropout))  # Randomly drops X% of the outputs from the LSTM layer
+model.add(Dense(8, activation='relu'))
 model.add(Dense(1))
 
 optimizer = Adam(learning_rate=cfg_learning_rate)
@@ -162,10 +191,29 @@ best_model = load_model(best_model_path)
 
 # Predictions on test set
 predictions_scaled = best_model.predict(X_test)
+# predictions_last = predictions_scaled[:, -1, :]
+# predictions = scaler.inverse_transform(predictions_last)
 predictions = scaler.inverse_transform(predictions_scaled)
-actual = scaler.inverse_transform(y_test)
+# actual = scaler.inverse_transform(y_test)
+actual = scaler.inverse_transform(y_test.reshape(-1, 1))
+
+# # actual_months = df['month'].iloc[val_end:].reset_index(drop=True)
+# # pred_months = actual_months[-len(predictions):]
+# context_offset = 12  # e.g., show 12 extra months before predictions start
+
+# # Compute the starting index for the extended actual series
+# extended_index = max(0, val_end - context_offset)
+
+# # Get extended actual months and values
+# extended_actual_months = df['month'].iloc[extended_index:].reset_index(drop=True)
+# extended_actual = scaler.inverse_transform(vessel_data[extended_index:])
+
+# # The prediction portion remains as before;
+# # assuming predictions correspond to the last len(predictions) months 
+# pred_months = extended_actual_months.iloc[-len(predictions):].reset_index(drop=True)
 
 
+# show_predictions_diagram(extended_actual_months, extended_actual, pred_months, predictions, save_path=f"{model_dir}/predictions_diagram.png")
 
 # Saving model config and predictions diagram
 print(f"Num of predictions: {len(predictions)}")
