@@ -2,13 +2,16 @@ import numpy as np
 import json
 import pandas as pd
 import matplotlib.pyplot as plt
+import tensorflow as tf
 from mylib import *
 from keras import Sequential
 from keras.layers import LSTM, Dense, Dropout, GRU # type: ignore
 from keras.callbacks import ModelCheckpoint, EarlyStopping, ReduceLROnPlateau # type: ignore
 from keras.optimizers import Adam # type: ignore
 from keras.models import load_model # type: ignore
-from sklearn.preprocessing import MinMaxScaler
+from sklearn.preprocessing import MinMaxScaler, RobustScaler,StandardScaler
+from sklearn.model_selection import TimeSeriesSplit
+
 
 ###### CONFIG ######
 input_csv = 'csv/SingapurCargoVesselsMonthly.csv'
@@ -19,27 +22,27 @@ best_model_path = f"{model_dir}/best_model.h5"
 
 
 sequence_length = 12 # how many months to look back
-cfg_epochs = 400
-cfg_patience = 50
-cfg_batch_size = 16
+cfg_epochs = 700
+cfg_patience = 80
+cfg_batch_size = 128
 cfg_LSTM_units = 64
-cfg_dropout = 0.01
-cfg_train_ratio = 0.80
-cfg_validation_ratio = 0.10
-cfg_learning_rate = 0.0005
+cfg_dropout = 0.40
+holdout_fraction = 0.10
+cfg_folds_num = 10
+cfg_learning_rate = 0.0005 *(cfg_batch_size   /4 ) # Adjust learning rate based on batch size
 cfg_recurrent_dropout = 0.0
 cfg_loss = 'mean_squared_error'
 
 run_params = {
     'input_csv': input_csv,
     'sequence_length': sequence_length,
-    'cfg_train_ratio': cfg_train_ratio,
-    'cfg_validation_ratio': cfg_validation_ratio,
     'cfg_epochs': cfg_epochs,
     'cfg_patience': cfg_patience,
     'cfg_batch_size': cfg_batch_size,
     'cfg_LSTM_units': cfg_LSTM_units,
     'cfg_dropout': cfg_dropout,
+    'holdout_fraction': holdout_fraction,
+    'cfg_folds_num': cfg_folds_num,
     'cfg_learning_rate': cfg_learning_rate,
     'cfg_loss': cfg_loss,
 }
@@ -53,10 +56,6 @@ run_params = {
 # Load the dataset
 dataset = pd.read_csv(input_csv)
 dataset['month'] = pd.to_datetime(dataset['month'], format='%Y-%m')
-# print(dataset.head())
-
-# TODO:
-# Perform data preprocessing steps (e.g., handle missing values, normalization)
 
 # Show the diagram of original data for specific months
 # filtered_data = filter_data(dataset,'1993-01', '1993-12')
@@ -66,8 +65,6 @@ dataset['month'] = pd.to_datetime(dataset['month'], format='%Y-%m')
 # Replace 'vessels.csv' with your actual CSV file path
 df = pd.read_csv(input_csv, parse_dates=['month'])
 
-# Make sure the dataframe is sorted by date
-# df = df.sort_values(by='month').reset_index(drop=True)
 
 df['month_num'] = df['month'].dt.month  # Month as an integer from 1 to 12
 df['month_sin'] = np.sin(2 * np.pi * df['month_num'] / 12)
@@ -77,162 +74,126 @@ df['month_cos'] = np.cos(2 * np.pi * df['month_num'] / 12)
 vessel_data = df['vessels'].values.reshape(-1, 1)
 
 # Scale the data to [0,1] range to help LSTM training
-# scaler = MinMaxScaler(feature_range=(0, 1))
-# vessel_data_scaled = scaler.fit_transform(vessel_data)
-# Extract and scale vessel counts
-vessel_data = df['vessels'].values.reshape(-1, 1)
 scaler = MinMaxScaler(feature_range=(0, 1))
-vessel_data_scaled = scaler.fit_transform(vessel_data)
 
-# Extract the cyclical features (they are already between -1 and 1)
+vessel_data_scaled = scaler.fit_transform(vessel_data)
+# Extract cyclical features (already between -1 and 1)
 month_features = df[['month_sin', 'month_cos']].values
 
 # Combine features: each row now has [scaled vessels, month_sin, month_cos]
 features = np.concatenate([vessel_data_scaled, month_features], axis=1)
 
-
-dataset_size = len(df)
-# Prepare the input and output sequences
-# X_all, y_all = create_sequences(vessel_data_scaled, sequence_length)
+# Create sequences using your helper function.
+# Note: target_idx=0 means the target is the vessel count.
 X_all, y_all = create_sequences(features, sequence_length, target_idx=0)
+print(f"Total sequences: {len(X_all)}")
 
-# Train-test split
-# Split the data into training and testing sets 80/20
-# For example, use the last 12 months (or more) as test
-train_size = int(len(X_all) * cfg_train_ratio)
-val_end= int(len(X_all) * (cfg_train_ratio + cfg_validation_ratio))
+# Split the data into training+validation and test sets
+# The holdout set is not visible for model during the training process
+# It is to test the final performance on the data that it has never seen
+holdout_size = int(len(X_all) * holdout_fraction)
+X_trainval = X_all[:-holdout_size]
+y_trainval = y_all[:-holdout_size]
+X_test = X_all[-holdout_size:]
+y_test = y_all[-holdout_size:]
+print(f"Train+Val size for CV: {len(X_trainval)}")
+print(f"Test size (hold-out): {len(X_test)}")
 
-X_train, y_train = X_all[:train_size], y_all[:train_size]
-X_val, y_val     = X_all[train_size:val_end], y_all[train_size:val_end]
-X_test, y_test   = X_all[val_end:], y_all[val_end:]
-print(f"Train size: {len(X_train)} ")
-print(f"Validation size: {len(X_val)} ")
-print(f"Test size: {len(X_test)} ")
+print(f"Total sequences: {len(X_all)}")
 
-# -------------------------------------------------
-# 2. Build the LSTM Model
-# -------------------------------------------------
+tscv = TimeSeriesSplit(n_splits=cfg_folds_num)  
 
-# Create checkopoint callback,
-# to save only the best model 
+cv_losses = []
+fold = 1
+best_fold_loss = float('inf')
 
-checkpoint = ModelCheckpoint(
-    best_model_path,         # TODO: add path, and create unique model names
+# Loop over each fold
+for train_index, val_index in tscv.split(X_all):
+    print(f"\n====== Fold {fold} ======")
+    X_train_cv, y_train_cv = X_all[train_index], y_all[train_index]
+    X_val_cv, y_val_cv     = X_all[val_index], y_all[val_index]
+    fold_model_path = f"{model_dir}/fold_{fold}_best_model.h5"
+
+    
+    # Create tf.data Datasets for this fold
+    train_dataset = tf.data.Dataset.from_tensor_slices((X_train_cv, y_train_cv))
+    train_dataset = train_dataset.shuffle(buffer_size=len(X_train_cv), reshuffle_each_iteration=True)
+    train_dataset = train_dataset.batch(cfg_batch_size)
+    train_dataset = train_dataset.prefetch(tf.data.AUTOTUNE)
+    
+    val_dataset = tf.data.Dataset.from_tensor_slices((X_val_cv, y_val_cv))
+    val_dataset = val_dataset.batch(cfg_batch_size)
+    val_dataset = val_dataset.prefetch(tf.data.AUTOTUNE)
+    
+    # Define model architecture for this fold
+    model = Sequential()
+    # First GRU layer with input_shape; only need to specify input_shape here
+    model.add(GRU(cfg_LSTM_units, return_sequences=True, 
+                  input_shape=(sequence_length, 3),
+                  recurrent_dropout=cfg_recurrent_dropout))
+    # Second GRU layer returning final state only
+    model.add(GRU(cfg_LSTM_units, return_sequences=False, 
+                  recurrent_dropout=cfg_recurrent_dropout))
+    model.add(Dropout(cfg_dropout))
+    model.add(Dense(8, activation='relu'))
+    model.add(Dense(1))
+    
+    optimizer = Adam(learning_rate=cfg_learning_rate)
+    model.compile(optimizer=optimizer, loss=cfg_loss)
+    
+    # Setup callbacks for this fold 
+    checkpoint = ModelCheckpoint(
+    fold_model_path,         # TODO: add path, and create unique model names
     monitor='val_loss',      # metric to monitor
     verbose=1,               # verbosity mode (1 = progress messages)
     save_best_only=True,     # only save when the monitored metric improves
     mode='min'               # mode should be 'min' if you're monitoring loss
 )
-
-# Callback to stop training if validation loss doesn't improve for X epochs
-early_stopping = EarlyStopping(
-    monitor='val_loss',
-    patience=cfg_patience,
-    verbose=1,
-    # restore_best_weights=True
-)
-
-# Create the ReduceLROnPlateau callback
-reduce_lr = ReduceLROnPlateau(
-    monitor='val_loss',  # Metric to monitor
-    factor=0.1,          # Reduce learning rate by half
-    patience=15,         # Wait 10 epochs before reducing learning rate
-    verbose=1,           # Print a message when the learning rate is reduced
-    min_lr=1e-3         # Minimum learning rate allowed
-)
-
-
-# TODO add Dropout layers to prevent overfitting
-model = Sequential()
-model.add(GRU(cfg_LSTM_units, return_sequences=True, 
-                input_shape=(sequence_length, 3),
-                recurrent_dropout=cfg_recurrent_dropout)
-               )
-model.add(Dropout(cfg_dropout))  # Randomly drops X% of the outputs from the LSTM layer
-model.add(GRU(cfg_LSTM_units, return_sequences=True, 
-                input_shape=(sequence_length, 3),
-                recurrent_dropout=cfg_recurrent_dropout)
-               )
-
-model.add(Dropout(cfg_dropout))  # Randomly drops X% of the outputs from the LSTM layer
-model.add(GRU(cfg_LSTM_units, return_sequences=True, 
-                input_shape=(sequence_length, 3),
-                recurrent_dropout=cfg_recurrent_dropout)
-               )
-# model.add(Dropout(cfg_dropout))  # Randomly drops X% of the outputs from the LSTM layer
-# model.add(LSTM(cfg_LSTM_units, recurrent_dropout=cfg_recurrent_dropout))
-model.add(GRU(cfg_LSTM_units, recurrent_dropout=cfg_recurrent_dropout,input_shape=(sequence_length, 3)))
-# model.add(Dropout(cfg_dropout))  # Randomly drops X% of the outputs from the LSTM layer
-model.add(Dense(8, activation='relu'))
-model.add(Dense(1))
-
-optimizer = Adam(learning_rate=cfg_learning_rate)
-model.compile(optimizer=optimizer, loss=cfg_loss)
-
-# -------------------------------------------------
-# 3. Train the Model
-# -------------------------------------------------
-history = model.fit(
-    X_train, y_train, 
-    epochs=cfg_epochs, 
-    batch_size=cfg_batch_size,
-    validation_data=(X_val, y_val), 
-    verbose=1,
-    callbacks=[checkpoint,early_stopping]  # Add the checkpoint callback
+    early_stopping = EarlyStopping(monitor='val_loss', patience=cfg_patience, verbose=1, restore_best_weights=True)
+    reduce_lr = ReduceLROnPlateau(monitor='val_loss', factor=0.9, patience=20, verbose=1, min_lr=1e-4)
+    
+    # Train the model for this fold
+    history = model.fit(
+        train_dataset,
+        epochs=cfg_epochs,
+        validation_data=val_dataset,
+        callbacks=[early_stopping, reduce_lr,checkpoint],
+        verbose=1
     )
-
-# -------------------------------------------------
-# 4. Evaluate & Predict
-# -------------------------------------------------
-# Load the best model
-best_model = load_model(best_model_path)
-
-
-
-# Predictions on test set
-predictions_scaled = best_model.predict(X_test)
-# predictions_last = predictions_scaled[:, -1, :]
-# predictions = scaler.inverse_transform(predictions_last)
-predictions = scaler.inverse_transform(predictions_scaled)
-# actual = scaler.inverse_transform(y_test)
-actual = scaler.inverse_transform(y_test.reshape(-1, 1))
-
-# # actual_months = df['month'].iloc[val_end:].reset_index(drop=True)
-# # pred_months = actual_months[-len(predictions):]
-# context_offset = 12  # e.g., show 12 extra months before predictions start
-
-# # Compute the starting index for the extended actual series
-# extended_index = max(0, val_end - context_offset)
-
-# # Get extended actual months and values
-# extended_actual_months = df['month'].iloc[extended_index:].reset_index(drop=True)
-# extended_actual = scaler.inverse_transform(vessel_data[extended_index:])
-
-# # The prediction portion remains as before;
-# # assuming predictions correspond to the last len(predictions) months 
-# pred_months = extended_actual_months.iloc[-len(predictions):].reset_index(drop=True)
+    
+    # Evaluate on the validation set for this fold
+    fold_loss = model.evaluate(val_dataset, verbose=0)
+    print(f"Fold {fold} validation loss: {fold_loss}")
+    cv_losses.append(fold_loss)
+    
+    val_loss = model.evaluate(val_dataset, verbose=0)
+    print(f"Fold {fold} validation loss: {val_loss}")
+    cv_losses.append(val_loss)
+    
+    if val_loss < best_fold_loss:
+        best_fold_loss = val_loss
+        best_fold_model_path = fold_model_path
+    fold += 1
 
 
-# show_predictions_diagram(extended_actual_months, extended_actual, pred_months, predictions, save_path=f"{model_dir}/predictions_diagram.png")
+print(f"\nAverage Cross-Validation Loss: {np.mean(cv_losses)}")
+print(f"Best Fold Validation Loss: {best_fold_loss}")
 
-# Saving model config and predictions diagram
-print(f"Num of predictions: {len(predictions)}")
-print(f"Num of actual test entries: {len(actual)}")
-
-# The evaluation on test set is done within the model.fit(),
-# So we just read from the history object
-save_model_loss(model_dir, min(history.history['val_loss']))
-
+# Final evaluation of best model on the holdout set
+best_model = load_model(best_fold_model_path)
+print("Loaded best model from cross-validation.")
+save_model_loss(model_dir, min(history.history['val_loss']),best_fold_model_path)
 
 save_model_config(best_model, run_params, model_dir)
 
+test_dataset = tf.data.Dataset.from_tensor_slices((X_test, y_test))
+test_dataset = test_dataset.batch(cfg_batch_size).prefetch(tf.data.AUTOTUNE)
+test_loss = best_model.evaluate(test_dataset, verbose=0)
+print(f"Test Loss of the best model: {test_loss}")
 
-# Plot test predictions vs. actual values
-test_months = df['month'].iloc[val_end + sequence_length:].reset_index(drop=True)
-
-show_predictions_diagram(
-    test_months, 
-    predictions, 
-    actual, 
-    save_path=f"{model_dir}/predictions_diagram.png"
-)
+# Plotting the predictions of holdout set
+predictions_scaled = best_model.predict(X_test)
+predictions = scaler.inverse_transform(predictions_scaled)
+actual = scaler.inverse_transform(y_test.reshape(-1, 1))
+test_months = df['month'].iloc[-len(X_test):].reset_index(drop=True)
+show_predictions_diagram(test_months, predictions, actual, save_path=f"{model_dir}/predictions_diagram.png")
